@@ -112,15 +112,6 @@ function showtable(t, indent)
     end
 end
 
-function dep_base(dep)
-    dep = string.gsub(dep, "^%?%s+", "")
-    local i = string.find(dep, "%s*[=><].*")
-    if i == nil then
-        return dep
-    end
-    return string.sub(dep, 1, i-1)
-end
-
 function Loader.getModList(mod_dir)
     local f = assert(io.open(mod_dir .. "/mod-list.json"))
     local s = f:read("*a")
@@ -136,9 +127,49 @@ function Loader.getModList(mod_dir)
     return modnames
 end
 
+local dependency_type = {
+    required = 1,
+    optional = 2,
+    hidden_optional = 3,
+    conflict = 4
+}
+
+local function string_trim(s)
+  return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function parse_dependency(dep_string)
+    local dependency = {}
+    local first_char = string.sub(dep_string, 1, 1)
+    local start_idx_name_part
+    if first_char == "!" then
+        dependency.type = dependency_type.conflict
+        start_idx_name_part = 2
+    elseif first_char == "?" then
+        dependency.type = dependency_type.optional
+        start_idx_name_part = 2
+    elseif first_char == "(" then
+        local prefix_remainder = string.sub(dep_string, 2, 3)
+        if prefix_remainder == "?)" then
+            dependency.type = dependency_type.hidden_optional
+            start_idx_name_part = 4
+        else
+            error("unable to parse dependency string '" .. dep_string .."'")
+        end
+    else
+        dependency.type = dependency_type.required
+        start_idx_name_part = 1
+    end
+
+    local start_idx_version_part = string.find(dep_string, "[=><].*")
+    local end_idx_name_part = (start_idx_version_part or 0) - 1
+    dependency.name = string_trim(string.sub(dep_string, start_idx_name_part, end_idx_name_part))
+
+    return dependency
+end
+
 local function mergeOrders(order, suborder)
     for _, subdep in ipairs(suborder) do
-        subdep = dep_base(subdep)
         local found = false
         for _, dep in ipairs(order) do
             if dep == subdep then
@@ -160,18 +191,20 @@ local function getDeps(module_info, name)
     end
     if not mod.dependencies then
         -- no dependencies were declared in info.json
-        mod.dependencies = {}
+        mod.dependencies = {"base"}
     end
     local deps = {}
-    --table.insert(deps, mod)
-    for _, raw_dep in ipairs(mod.dependencies) do
-        local dep = dep_base(raw_dep)
-        local required = string.sub(raw_dep, 1, 1) ~= "?"
-        if not module_info[dep] and required then
-            return {}
+    for _, dep_string in ipairs(mod.dependencies) do
+        local dep = parse_dependency(dep_string)
+        local dep_is_loaded = module_info[dep.name]
+        if not dep_is_loaded and dep.type == dependency_type.required then
+            error("Required depedency '" .. dep.name .. "' missing.")
         end
-        if module_info[dep] then
-            local subdeps = getDeps(module_info, dep)
+        if dep_is_loaded then
+            if dep.type == dependency_type.conflict then
+                error("Conflicting dependency '" .. dep.name .. "' present.")
+            end
+            local subdeps = getDeps(module_info, dep.name)
             mergeOrders(deps, subdeps)
         end
     end
