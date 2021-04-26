@@ -116,15 +116,6 @@ function showtable(t, indent)
     end
 end
 
-function dep_base(dep)
-    dep = string.gsub(dep, "^%?%s+", "")
-    local i = string.find(dep, "%s*[=><].*")
-    if i == nil then
-        return dep
-    end
-    return string.sub(dep, 1, i-1)
-end
-
 function Loader.getModList(mod_dir)
     local f = assert(io.open(mod_dir .. "/mod-list.json"))
     local s = f:read("*a")
@@ -140,60 +131,99 @@ function Loader.getModList(mod_dir)
     return modnames
 end
 
-local function mergeOrders(order, suborder)
-    for _, subdep in ipairs(suborder) do
-        subdep = dep_base(subdep)
-        local found = false
-        for _, dep in ipairs(order) do
-            if dep == subdep then
-                found = true
-                break
-            end
+local dependency_type = {
+    required = 1,
+    optional = 2,
+    hidden_optional = 3,
+    conflict = 4
+}
+
+local function string_trim(s)
+  return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function parse_dependency(dep_string)
+    local dependency = {}
+    local first_char = string.sub(dep_string, 1, 1)
+    local start_idx_name_part
+    if first_char == "!" then
+        dependency.type = dependency_type.conflict
+        start_idx_name_part = 2
+    elseif first_char == "?" then
+        dependency.type = dependency_type.optional
+        start_idx_name_part = 2
+    elseif first_char == "(" then
+        local prefix_remainder = string.sub(dep_string, 2, 3)
+        if prefix_remainder == "?)" then
+            dependency.type = dependency_type.hidden_optional
+            start_idx_name_part = 4
+        else
+            error("unable to parse dependency string '" .. dep_string .."'")
         end
-        if not found then
-            table.insert(order, subdep)
+    else
+        dependency.type = dependency_type.required
+        start_idx_name_part = 1
+    end
+
+    local start_idx_version_part = string.find(dep_string, "[=><].*")
+    local end_idx_name_part = (start_idx_version_part or 0) - 1
+    dependency.name = string_trim(string.sub(dep_string, start_idx_name_part, end_idx_name_part))
+
+    return dependency
+end
+
+local function build_topology(module_info, module)
+    for _, dep_string in pairs(module.dependencies) do
+        local parsed_dep = parse_dependency(dep_string)
+        local dep_module = module_info[parsed_dep.name]
+
+        if not dep_module and parsed_dep.type == dependency_type.required then
+            error("Required depedency '" .. parsed_dep.name .. "' missing.")
+        end
+        if dep_module and parsed_dep.type == dependency_type.conflict then
+            error("Conflicting dependency '" .. parsed_dep.name .. "' present.")
+        end
+
+        if dep_module then
+            table.insert(dep_module.topology_data.dependants, module.name)
+            module.topology_data.dependencies_count = module.topology_data.dependencies_count + 1
         end
     end
 end
 
-local function getDeps(module_info, name)
-    local mod = module_info[name]
-    if not mod then io.stderr:write(name .. "\n") end
-    if mod.deps then
-        return mod.deps
-    end
-    if not mod.dependencies then
-        -- no dependencies were declared in info.json
-        mod.dependencies = {}
-    end
-    local deps = {}
-    --table.insert(deps, mod)
-    for _, raw_dep in ipairs(mod.dependencies) do
-        local dep = dep_base(raw_dep)
-        local required = string.sub(raw_dep, 1, 1) ~= "?"
-        if not module_info[dep] and required then
-            return {}
-        end
-        if module_info[dep] then
-            local subdeps = getDeps(module_info, dep)
-            mergeOrders(deps, subdeps)
+local function topological_sort(module_info, root_nodes, order)
+    local next_level_nodes = {}
+    table.sort(root_nodes, function(a, b)
+        return string.lower(a) < string.lower(b)
+    end)
+    for _, node in ipairs(root_nodes) do
+        table.insert(order, node)
+        for _, dependant in pairs(module_info[node].topology_data.dependants) do
+           local topology_data = module_info[dependant].topology_data
+           topology_data.dependencies_count = topology_data.dependencies_count - 1
+           if topology_data.dependencies_count == 0 then
+               table.insert(next_level_nodes, dependant)
+           end
         end
     end
-    table.insert(deps, name)
-    return deps
+    if #next_level_nodes > 0 then
+        topological_sort(module_info, next_level_nodes, order)
+    end
 end
 
 function Loader.dependenciesOrder(module_info)
+    for _, module in pairs(module_info) do
+        module.topology_data = {
+            dependants = {},
+            dependencies_count = 0
+        }
+    end
+    for _, module in pairs(module_info) do
+        build_topology(module_info, module)
+    end
     local order = {}
-    local mod_names = {}
-    for name, _ in pairs(module_info) do
-        table.insert(mod_names, name)
-    end
-    table.sort(mod_names)
-    for _, name in ipairs(mod_names) do
-        local suborder = getDeps(module_info, name)
-        mergeOrders(order, suborder)
-    end
+    -- core is known to be the only root because everything depends on it
+    topological_sort(module_info, {"core"}, order)
     return order
 end
 
@@ -328,12 +358,19 @@ function Loader.addModuleInfo(path, module_info)
     module_info[basename] = info
 end
 
+--- add base as a dependency if info.json did not specify a dependencies array
+--- add core as a dependency to every other mode to make sure core always loads first
 --- add the version information to the core module by searching in the base module
 function Loader.moduleInfoCompatibilityPatches(module_info)
     local k, v, version
     for k,v in pairs(module_info) do
+        if k ~= "base" and k ~= "core" then
+            v.dependencies = v.dependencies or {"base"}
+        end
+        if k ~= 'core' then
+            table.insert(v['dependencies'], 'core')
+        end
         if k == 'base' then
-            v['dependencies'] = {'core'}
             version = v['version']
         end
     end
