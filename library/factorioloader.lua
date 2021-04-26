@@ -10,6 +10,7 @@ require("zip")
 local CFGParser = require("library/cfgparser")
 local SettingLoader = require("library/settingloader")
 local ZipModLoader = require("library/ZipModLoader")
+local CrossModLoader = require("library/CrossModLoader")
 mods = {}
 
 function endswith(s, sub)
@@ -30,6 +31,9 @@ function Loader.load_data(game_path, mod_dir)
     local order
 
     settings = SettingLoader.load(mod_dir .. "/mod-settings.dat")
+
+    local crossModLoader = CrossModLoader.new(module_info)
+    table.insert(package.searchers, 1, crossModLoader)
 
     for i = 1, #paths do
         Loader.addModuleInfo(paths[i], module_info)
@@ -196,7 +200,9 @@ end
 Module = {}
 Module.__index = Module
 
-function Module:run(filename)
+function Module:load(filename, action)
+    filename = string.gsub(filename, "%.", "/")
+    action = action or function (f) return f end
     local old_path = package.path
     local file_path = self.localPath .. "/" .. filename .. ".lua"
     local f = io.open(file_path, "r")
@@ -206,8 +212,12 @@ function Module:run(filename)
         return
     end
     package.path = self.localPath .. "/?.lua;" .. package.path
-    dofile(file_path)
+    local ret = action(assert(loadfile(file_path)))
     package.path = old_path
+    return ret
+end
+function Module:run(filename)
+    return self:load(filename, function (f) return f() end)
 end
 function Module:locale(locales)
     local locale_dir = self.localPath .. "/locale"
@@ -268,18 +278,24 @@ function ZipModule.new(dirname, mod_name)
     setmetatable(info, ZipModule)
     return info
 end
-function ZipModule.run(self, filename)
+function ZipModule.load(self, filename, action)
+    action = action or function (f) return f end
     local loader = ZipModLoader.new(self.mod_path, self.mod_name, self.arc_subfolder)
-    table.insert(package.searchers, 1, loader)
+    table.insert(package.searchers, 2, loader)
     local mod = loader(filename)
     if type(mod) == "string" then
-        table.remove(package.searchers, 1)
+        table.remove(package.searchers, 2)
         loader:close()
         return
     end
-    if mod ~= nil then mod() end
-    table.remove(package.searchers, 1)
+    local ret
+    if mod ~= nil then ret = action(mod) end
+    table.remove(package.searchers, 2)
     loader:close()
+    return ret
+end
+function ZipModule.run(self, filename)
+    self.load(self, filename, function (f) return f() end)
 end
 function ZipModule:locale(locales)
     local arc = assert(zip.open(self.zip_path))
